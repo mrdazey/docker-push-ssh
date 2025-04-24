@@ -1,8 +1,9 @@
 sudo: required
 language: python
 python:
-  - "2.7"
+  - "3.12"
 script:
   - bash ./test.sh
 services:
   - docker
+  
