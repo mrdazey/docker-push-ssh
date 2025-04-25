@@ -12,10 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import argparse
+import subprocess
 import os
 import socket
 import sys
 import time
+import shutil
 from http import client
 from urllib import request
 from urllib.error import URLError
@@ -94,18 +96,14 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
                     "-p",
                     "127.0.0.1:5000:5000",
                     "-v",
-                    "{0}:/etc/ssh_key_file".format(sshIdentityFile),
-                    "brthornbury/docker-alpine-ssh",
+                    "./dpssh/ssh:/root/.ssh",
+                    "nexus.rigs.dev:8082/brthornbury/docker-alpine-ssh",
                     "ssh",
                     "-N",
                     "-L",
                     "*:5000:localhost:{0}".format(registryPort),
-                    "-i",
-                    "/etc/ssh_key_file",
                     "-o",
                     "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
                     "-p",
                     sshPort,
                     sshHost,
@@ -269,6 +267,25 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
 
     return True
 
+def copy_directory_contents(source_dir, destination_dir):
+    """Copies the contents of the source directory to the destination directory.
+
+    Args:
+        source_dir: Path to the source directory.
+        destination_dir: Path to the destination directory.
+    """
+    try:
+        shutil.copytree(source_dir, destination_dir)
+    except FileExistsError:
+         # If destination exists, copy contents individually
+        for item in os.listdir(source_dir):
+            s = os.path.join(source_dir, item)
+            d = os.path.join(destination_dir, item)
+            if os.path.isfile(s):
+                shutil.copy2(s, d)
+            elif os.path.isdir(s):
+                copy_directory_contents(s, d)
+
 
 def main():
     parser = argparse.ArgumentParser(
@@ -286,6 +303,14 @@ def main():
     )
 
     parser.add_argument(
+        "-p",
+        "--ssh-port",
+        type=str,
+        help="[optional] Port on ssh host to connect to. (Default is 22)",
+        default="22",
+    )
+
+    parser.add_argument(
         "-i",
         "--ssh-identity-file",
         type=str,
@@ -294,11 +319,11 @@ def main():
     )
 
     parser.add_argument(
-        "-p",
-        "--ssh-port",
+        "-c",
+        "--ssh-config-folder",
         type=str,
-        help="[optional] Port on ssh host to connect to. (Default is 22)",
-        default="22",
+        help="[required] Path to the ssh config folder on your local host. "
+        "Required, password auth not supported. (ex. ~/.ssh/config)",
     )
 
     parser.add_argument(
@@ -317,23 +342,42 @@ def main():
 
     args = parser.parse_args()
 
-    # assert args.ssh_identity_file is not None
-
-    sshIdentityFileAbsolutePath = os.path.abspath(os.path.expanduser(args.ssh_identity_file))
 
     print("[REQUIRED] Ensure localhost:5000 is added to your insecure registries.")
 
-    success = pushImage(
-        args.docker_image,
-        args.ssh_host,
-        sshIdentityFileAbsolutePath,
-        args.ssh_port,
-        args.prime_image,
-        args.registry_port,
-    )
+    # assert args.ssh_identity_file is not None
 
-    if not success:
-        sys.exit(1)
+    sshIdentityFileAbsolutePath = os.path.abspath(os.path.expanduser(args.ssh_identity_file))
+    try:
+        if not os.path.exists("dpssh"):
+            os.mkdir("dpssh")
+        if not os.path.exists("dpssh/ssh"):
+            os.mkdir("dpssh/ssh")
+        copy_directory_contents(args.ssh_config_folder, "dpssh/ssh")
+        process = subprocess.run(['sudo', 'chown', '-R', '0:0', 'dpssh/ssh'], capture_output=True, text=True)
+        if process.returncode != 0:
+            print(process.stderr)
+            sys.exit(1)
+        process = subprocess.run(['sudo', 'chmod', '0700', 'dpssh/ssh'], capture_output=True, text=True)
+        if process.returncode == 0:
+            success = pushImage(
+                args.docker_image,
+                args.ssh_host,
+                sshIdentityFileAbsolutePath,
+                args.ssh_port,
+                args.prime_image,
+                args.registry_port,
+            )
+            if not success:
+                sys.exit(1)
+        else:
+            print(process.stdout)
+            print(process.stderr)
+            sys.exit(1)
+    except Exception as e:
+        print(e)
+    finally:
+        process = subprocess.run(['sudo', 'rm', '-rf', 'dpssh'], capture_output=True, text=True)
 
 
 if __name__ == "__main__":
