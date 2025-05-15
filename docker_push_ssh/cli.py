@@ -53,20 +53,14 @@ def waitForSshTunnelInit(retries=20, delay=1.0):
     return False
 
 
-def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages, registryPort):
+def pushImage(dockerImageTagList, sshHost, sshPort, primeImages, registryPort):
     # Setup remote docker registry
     print("Setting up secure private registry... ")
     registryCommandResult = Command(
         "ssh",
         [
-            "-i",
-            sshIdentityFile,
             "-p",
             sshPort,
-            "-o",
-            "StrictHostKeyChecking=no",
-            "-o",
-            "UserKnownHostsFile=/dev/null",
             sshHost,
             'sh -l -c "docker run -d -v /etc/docker-push-ssh/registry:/var/lib/registry '
             + '--name docker-push-ssh-registry -p 127.0.0.1:{0}:5000 registry"'.format(
@@ -78,13 +72,42 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
     if registryCommandResult.failed():
         print("ERROR")
         print((registryCommandResult.stdout))
-        print((registryCommandResult.stderr))
+        print((registryCommandResult.stderr), file=sys.stderr)
         return False
 
     try:
         # Establish ssh tunnel
         print("Establishing SSH Tunnel...")
+        home_dir = os.environ.get("HOME")
+        uid = os.getuid()
+        gid = os.getgid()
+        with open("Dockerfile", "w") as dockerfile:
+            dockerfile.write("FROM brthornbury/docker-alpine-ssh\n")
+            dockerfile.write(f"ARG UID={uid}\n")
+            dockerfile.write(f"ARG GID={gid}\n")
+            dockerfile.write("RUN addgroup -g $GID myuser && \\\n")
+            dockerfile.write("    adduser -D -u $UID -G myuser myuser\n")
+            dockerfile.write("USER myuser\n")
+            dockerfile.close()
+        dockerPullCommand = Command(
+            "docker", ["pull", "brthornbury/docker-alpine-ssh"]
+        ).execute()
+        if dockerPullCommand.failed():
+            print("ERROR Pulling Base Image")
+            print((dockerPullCommand.stdout))
+            print((dockerPullCommand.stderr), file=sys.stderr)
+            sys.exit(1)
 
+        dockerBuildCommand = Command(
+            "docker", ["build", "--provenance=false", ".", "-t", "dockersshpushimage"]
+        ).execute()
+        if dockerBuildCommand.failed():
+            print("ERROR Building Image")
+            print((dockerBuildCommand.stdout))
+            print((dockerBuildCommand.stderr), file=sys.stderr)
+            sys.exit(1)
+
+        os.remove("Dockerfile")
         sshTunnelCommandResult = (
             Command(
                 "docker",
@@ -95,9 +118,10 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
                     "docker-push-ssh-tunnel",
                     "-p",
                     "127.0.0.1:5000:5000",
+                    #                    f"-u {uid}:{gid}",
                     "-v",
-                    "./dpssh/ssh:/root/.ssh",
-                    "nexus.rigs.dev:8082/brthornbury/docker-alpine-ssh",
+                    f"{home_dir}/.ssh:/home/myuser/.ssh",
+                    "dockersshpushimage",
                     "ssh",
                     "-N",
                     "-L",
@@ -115,8 +139,8 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
 
         if sshTunnelCommandResult.failed():
             print("ERROR")
-            print((sshTunnelCommandResult.stdout))
-            print((sshTunnelCommandResult.stderr))
+            print((sshTunnelCommandResult.stdout), file=sys.stdout)
+            print((sshTunnelCommandResult.stderr), file=sys.stderr)
             return False
 
         print("Waiting for SSH Tunnel Initialization...")
@@ -136,7 +160,7 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
         if sshTunnelCommandResult.failed():
             print("ERROR")
             print((sshTunnelCommandResult.stdout))
-            print((sshTunnelCommandResult.stderr))
+            print((sshTunnelCommandResult.stderr), file=sys.stderr)
             return False
 
         print("Priming Registry with base images...")
@@ -147,14 +171,8 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
             primingCommand = Command(
                 "ssh",
                 [
-                    "-i",
-                    sshIdentityFile,
                     "-p",
                     sshPort,
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
                     sshHost,
                     'sh -l -c "docker pull {0}'.format(primeImage)
                     + ' && docker tag {0} localhost:{1}/{0} && docker push localhost:{1}/{0}"'.format(
@@ -166,14 +184,19 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
             if primingCommand.failed():
                 print("ERROR")
                 print((primingCommand.stdout))
-                print((primingCommand.stderr))
+                print((primingCommand.stderr), file=sys.stderr)
                 return False
 
         print("Tagging image(s) for push...")
         for dockerImageTag in dockerImageTagList:
             tagCommandResult = (
                 Command(
-                    "docker", ["tag", dockerImageTag, "localhost:5000/{0}".format(dockerImageTag)]
+                    "docker",
+                    [
+                        "tag",
+                        dockerImageTag,
+                        "localhost:5000/{0}".format(dockerImageTag),
+                    ],
                 )
                 .environment_dict(os.environ)
                 .execute()
@@ -182,7 +205,7 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
             if tagCommandResult.failed():
                 print("ERROR")
                 print((tagCommandResult.stdout))
-                print((tagCommandResult.stderr))
+                print((tagCommandResult.stderr), file=sys.stderr)
                 return False
 
         print("Pushing Image(s) from local host...")
@@ -197,7 +220,7 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
                 print("ERROR")
 
                 print((pushDockerImageCommandResult.stdout))
-                print((pushDockerImageCommandResult.stderr))
+                print((pushDockerImageCommandResult.stderr), file=sys.stderr)
 
                 print(
                     "Error Pushing Image: Ensure localhost:5000 is added to your insecure registries."
@@ -215,25 +238,21 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
             pullDockerImageCommandResult = Command(
                 "ssh",
                 [
-                    "-i",
-                    sshIdentityFile,
                     "-p",
                     sshPort,
-                    "-o",
-                    "StrictHostKeyChecking=no",
-                    "-o",
-                    "UserKnownHostsFile=/dev/null",
                     sshHost,
                     'sh -l -c "docker pull '
                     + "localhost:{1}/{0}".format(dockerImageTag, registryPort)
-                    + ' && docker tag localhost:{1}/{0} {0}"'.format(dockerImageTag, registryPort),
+                    + ' && docker tag localhost:{1}/{0} {0}"'.format(
+                        dockerImageTag, registryPort
+                    ),
                 ],
             ).execute()
 
             if pullDockerImageCommandResult.failed():
                 print("ERROR")
                 print((pullDockerImageCommandResult.stdout))
-                print((pullDockerImageCommandResult.stderr))
+                print((pullDockerImageCommandResult.stderr), file=sys.stderr)
                 return False
 
             print(("Pulled Image {0} Successfully...".format(dockerImageTag)))
@@ -243,14 +262,8 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
         Command(
             "ssh",
             [
-                "-i",
-                sshIdentityFile,
                 "-p",
                 sshPort,
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
                 sshHost,
                 'sh -l -c "docker rm -f docker-push-ssh-registry"',
             ],
@@ -267,25 +280,6 @@ def pushImage(dockerImageTagList, sshHost, sshIdentityFile, sshPort, primeImages
 
     return True
 
-def copy_directory_contents(source_dir, destination_dir):
-    """Copies the contents of the source directory to the destination directory.
-
-    Args:
-        source_dir: Path to the source directory.
-        destination_dir: Path to the destination directory.
-    """
-    try:
-        shutil.copytree(source_dir, destination_dir)
-    except FileExistsError:
-         # If destination exists, copy contents individually
-        for item in os.listdir(source_dir):
-            s = os.path.join(source_dir, item)
-            d = os.path.join(destination_dir, item)
-            if os.path.isfile(s):
-                shutil.copy2(s, d)
-            elif os.path.isdir(s):
-                copy_directory_contents(s, d)
-
 
 def main():
     parser = argparse.ArgumentParser(
@@ -294,7 +288,9 @@ def main():
         "setup a private registry."
     )
 
-    parser.add_argument("ssh_host", help="Host to push docker image to. (ex. username@myhost.com)")
+    parser.add_argument(
+        "ssh_host", help="Host to push docker image to. (ex. username@myhost.com)"
+    )
 
     parser.add_argument(
         "docker_image",
@@ -308,22 +304,6 @@ def main():
         type=str,
         help="[optional] Port on ssh host to connect to. (Default is 22)",
         default="22",
-    )
-
-    parser.add_argument(
-        "-i",
-        "--ssh-identity-file",
-        type=str,
-        help="[required] Path to the ssh identity file on your local host. "
-        "Required, password auth not supported. (ex. ~/.ssh/id_rsa)",
-    )
-
-    parser.add_argument(
-        "-c",
-        "--ssh-config-folder",
-        type=str,
-        help="[required] Path to the ssh config folder on your local host. "
-        "Required, password auth not supported. (ex. ~/.ssh/config)",
     )
 
     parser.add_argument(
@@ -342,42 +322,22 @@ def main():
 
     args = parser.parse_args()
 
-
     print("[REQUIRED] Ensure localhost:5000 is added to your insecure registries.")
 
     # assert args.ssh_identity_file is not None
 
-    sshIdentityFileAbsolutePath = os.path.abspath(os.path.expanduser(args.ssh_identity_file))
     try:
-        if not os.path.exists("dpssh"):
-            os.mkdir("dpssh")
-        if not os.path.exists("dpssh/ssh"):
-            os.mkdir("dpssh/ssh")
-        copy_directory_contents(args.ssh_config_folder, "dpssh/ssh")
-        process = subprocess.run(['sudo', 'chown', '-R', '0:0', 'dpssh/ssh'], capture_output=True, text=True)
-        if process.returncode != 0:
-            print(process.stderr)
-            sys.exit(1)
-        process = subprocess.run(['sudo', 'chmod', '0700', 'dpssh/ssh'], capture_output=True, text=True)
-        if process.returncode == 0:
-            success = pushImage(
-                args.docker_image,
-                args.ssh_host,
-                sshIdentityFileAbsolutePath,
-                args.ssh_port,
-                args.prime_image,
-                args.registry_port,
-            )
-            if not success:
-                sys.exit(1)
-        else:
-            print(process.stdout)
-            print(process.stderr)
+        success = pushImage(
+            args.docker_image,
+            args.ssh_host,
+            args.ssh_port,
+            args.prime_image,
+            args.registry_port,
+        )
+        if not success:
             sys.exit(1)
     except Exception as e:
         print(e)
-    finally:
-        process = subprocess.run(['sudo', 'rm', '-rf', 'dpssh'], capture_output=True, text=True)
 
 
 if __name__ == "__main__":
